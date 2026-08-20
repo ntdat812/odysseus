@@ -1367,6 +1367,30 @@ def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[d
     return None
 
 
+def _advertised_string_args():
+    """Map each advertised tool name to its parameters declared ``"type": "string"``.
+
+    Derived from FUNCTION_TOOL_SCHEMAS rather than restated, so the check cannot
+    drift from the schema the model was actually shown.
+    """
+    fields = {}
+    for entry in FUNCTION_TOOL_SCHEMAS:
+        function = entry.get("function") or {}
+        tool_name = function.get("name")
+        properties = ((function.get("parameters") or {}).get("properties") or {})
+        string_keys = tuple(
+            key
+            for key, spec in properties.items()
+            if isinstance(spec, dict) and spec.get("type") == "string"
+        )
+        if tool_name and string_keys:
+            fields[tool_name] = string_keys
+    return fields
+
+
+_STRING_ARG_FIELDS = _advertised_string_args()
+
+
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
     """Convert a native function call into a ToolBlock for the existing execution pipeline."""
     tool_type = _TOOL_NAME_MAP.get(name, name)
@@ -1395,6 +1419,22 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             return None
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
         args = {}
+
+    # A model can satisfy the object shape above while giving an advertised
+    # string parameter a value of the wrong type ({"command": 42}). The
+    # conversion below copies these straight into ToolBlock.content, so the
+    # mismatch only surfaces much later -- `block.content.strip()` in the agent
+    # loop raises AttributeError and aborts the whole turn, and the string
+    # concatenations here (write_file) raise TypeError before that. A malformed
+    # call must produce no block instead. Absent keys keep their existing
+    # default, so this only rejects a value the model actually sent.
+    for key in _STRING_ARG_FIELDS.get(name) or _STRING_ARG_FIELDS.get(tool_type) or ():
+        if key in args and not isinstance(args[key], str):
+            logger.warning(
+                f"Rejecting function call {name}: {key} must be a string, got "
+                f"{type(args[key]).__name__}"
+            )
+            return None
 
     required_args = _REQUIRED_NATIVE_TOOL_ARGS.get(tool_type)
     if required_args and not any(str(args.get(key) or "").strip() for key in required_args):
