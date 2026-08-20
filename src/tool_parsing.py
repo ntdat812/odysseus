@@ -98,6 +98,8 @@ _XML_TOOL_CALL_RE = re.compile(
     r"<(?:[\w]+:)?(?:tool_call|function_call)>\s*([\s\S]*?)</(?:[\w]+:)?(?:tool_call|function_call)>",
     re.IGNORECASE,
 )
+# Reused by _json_value_end: JSONDecoder instances are stateless and thread-safe.
+_JSON_DECODER = json.JSONDecoder()
 _XML_OPEN_TOOL_CALL_RE = re.compile(
     r"<(?:[\w]+:)?(?:tool_call|function_call)>\s*([\s\S]*)\Z",
     re.IGNORECASE,
@@ -1202,6 +1204,72 @@ def _iter_delimited(text, open_re, close_re):
         pos = cm.end()
 
 
+def _json_value_end(text: str, start: int):
+    """Index just past the JSON value beginning at ``start``, or None.
+
+    Uses the stdlib decoder rather than a hand-rolled brace/quote scan so
+    escapes, nesting and unicode escapes follow the same rules the later
+    ``json.loads`` will apply.
+    """
+    try:
+        _value, end = _JSON_DECODER.raw_decode(text, start)
+    except ValueError:
+        return None
+    return end
+
+
+def _iter_tool_call_wrappers(text):
+    """``_iter_delimited`` for the <tool_call> wrapper, but JSON-aware.
+
+    A Qwen/Hermes wrapper body is bare JSON, and a closing marker can legally
+    appear inside one of its string values::
+
+        <tool_call>{"name":"write_file","arguments":{"path":"n.txt",
+                    "content":"alpha </tool_call> omega"}}</tool_call>
+
+    Pairing the opener with the first *textual* closer truncates that body
+    mid-string, so the call is dropped and stripping consumes a different span
+    than parsing (issue #6013). When the body decodes as JSON, the closer is
+    therefore searched from the end of the decoded value; a body that is not
+    JSON, or does not decode, keeps the plain forward scan.
+
+    Still forward-only and O(n) overall: each opener's decode covers only its
+    own body, spans never overlap, and an opener with no reachable closer ends
+    the scan exactly as in ``_iter_delimited``.
+    """
+    pos = 0
+    while True:
+        om = _XML_TOOL_CALL_OPEN_RE.search(text, pos)
+        if om is None:
+            return
+        search_from = om.end()
+        if text[search_from:search_from + 1] in ("{", "["):
+            value_end = _json_value_end(text, search_from)
+            if value_end is not None:
+                search_from = value_end
+        cm = _XML_TOOL_CALL_CLOSE_RE.search(text, search_from)
+        if cm is None:
+            return
+        yield om.start(), om.end(), cm.start(), cm.end()
+        pos = cm.end()
+
+
+def _strip_tool_call_wrappers(text: str) -> str:
+    """Remove every <tool_call> wrapper span, using the same JSON-aware spans
+    the parser consumes so stripping cannot leave trailing wrapper syntax
+    behind (issue #6013)."""
+    spans = list(_iter_tool_call_wrappers(text))
+    if not spans:
+        return text
+    out = []
+    last = 0
+    for match_start, _inner_start, _inner_end, match_end in spans:
+        out.append(text[last:match_start])
+        last = match_end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _strip_delimited(text: str, open_re, close_re) -> str:
     """Remove every ``open_re ... close_re`` span (forward-only; see
     _iter_delimited). Equivalent to ``open_re([\\s\\S]*?)close_re`` ``re.sub('')``
@@ -1375,9 +1443,7 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
         # XML-like text inside JSON argument values stays data instead of
         # selecting a different tool.
         json_body_seen = False
-        for _ms, inner_start, inner_end, _me in _iter_delimited(
-            text, _XML_TOOL_CALL_OPEN_RE, _XML_TOOL_CALL_CLOSE_RE
-        ):
+        for _ms, inner_start, inner_end, _me in _iter_tool_call_wrappers(text):
             body = text[inner_start:inner_end]
             if _looks_like_json_body(body):
                 json_body_seen = True
@@ -1502,7 +1568,7 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     # output can't drive the O(n^2) lazy-rescan (ReDoS); see _iter_delimited.
     cleaned = _strip_delimited(cleaned, _TOOL_CALL_OPEN_RE, _TOOL_CALL_CLOSE_RE)
     cleaned = _strip_stepfun_tool_markup(cleaned)
-    cleaned = _strip_delimited(cleaned, _XML_TOOL_CALL_OPEN_RE, _XML_TOOL_CALL_CLOSE_RE)
+    cleaned = _strip_tool_call_wrappers(cleaned)
     cleaned = _XML_OPEN_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _strip_delimited(cleaned, _TOOL_CODE_OPEN_RE, _TOOL_CODE_CLOSE_RE)
     cleaned = _GEMMA_TOOL_CALL_RE.sub('', cleaned)
