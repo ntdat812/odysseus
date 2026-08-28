@@ -23,12 +23,18 @@ error to point at the cause. These tests pin the classification for both the
 unmounted and mounted forms of the same application route.
 """
 
+import tempfile
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
 from core.middleware import SecurityHeadersMiddleware
+
+_STATIC_DIR = Path(tempfile.mkdtemp(prefix="odysseus-static-"))
 
 
 ROUTES = (
@@ -36,19 +42,29 @@ ROUTES = (
     "/api/tools/mytool/render",
     "/api/document/doc1/render-pdf",
     "/api/other",
+    # An ordinary route whose own name ends in a relaxed suffix. Used by the
+    # collision cases: prefixed, its raw URL is indistinguishable from a tool
+    # render route, while the route Starlette matches is this one.
+    "/render",
 )
 
 
-def _client(root_path=""):
+def _client(root_path="", mount_static=False):
     app = FastAPI()
     app.add_middleware(SecurityHeadersMiddleware)
 
     for route in ROUTES:
         app.add_api_route(
             route,
-            lambda: HTMLResponse("<html></html>"),
+            lambda route=route: HTMLResponse(f"<html>{route}</html>"),
             methods=["GET"],
         )
+
+    if mount_static:
+        # Mirrors app.py: app.mount("/static", ...). A Mount rewrites the same
+        # scope dict it matches on, which is what makes classification order
+        # observable.
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     # Mirror what uvicorn's --root-path does: the ASGI scope keeps the prefixed
     # path, and root_path tells Starlette how much of it to strip before route
@@ -56,8 +72,12 @@ def _client(root_path=""):
     return TestClient(app, root_path=root_path)
 
 
+def _get(route, root_path="", mount_static=False):
+    return _client(root_path, mount_static).get(root_path + route)
+
+
 def _headers(route, root_path=""):
-    return _client(root_path).get(root_path + route).headers
+    return _get(route, root_path).headers
 
 
 @pytest.mark.parametrize("root_path", ["", "/odysseus"])
@@ -103,11 +123,61 @@ def test_baseline_headers_are_unconditional(root_path):
 def test_a_mount_prefix_cannot_be_spelled_to_claim_a_relaxed_policy():
     """A route is classified by what Starlette routes, not by the raw URL.
 
-    The relaxed branches are the security-relevant direction: a request whose
-    *prefixed* path happens to look like `/api/tools/.../render` must not
-    inherit the no-framing-headers policy when the application route it
-    actually reached is an ordinary one.
+    The prefix is chosen so the *raw* URL ends in `/render` under a
+    `/api/tools/...` prefix — indistinguishable from a tool render route to a
+    classifier reading `request.url.path` — while the route Starlette matches
+    is the ordinary `/render`. Asserting the body as well as the headers is
+    what makes this a real collision test: without it the case would still pass
+    if the request had 404'd and never reached the route at all.
     """
-    headers = _headers("/api/other", "/api/tools/x/render")
-    assert headers["x-frame-options"] == "DENY"
-    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+    response = _get("/render", "/api/tools/x")
+
+    assert response.status_code == 200
+    assert response.text == "<html>/render</html>"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+@pytest.mark.parametrize(
+    "prefix, route",
+    [
+        ("/api/tools/x", "/render"),
+        ("/api/document/d", "/render-pdf"),
+        ("/api/research", "/report/abc"),
+    ],
+)
+def test_no_relaxed_prefix_spelling_survives_route_matching(prefix, route):
+    """Same collision for each of the three relaxed branches."""
+    app = FastAPI()
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_api_route(route, lambda: HTMLResponse("<html>ok</html>"), methods=["GET"])
+    response = TestClient(app, root_path=prefix).get(prefix + route)
+
+    assert response.status_code == 200
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+def test_a_mounted_child_path_does_not_inherit_a_relaxed_policy():
+    """A Mount rewrites the scope it matched, so classify before dispatching.
+
+    Starlette moves the mount prefix into ``root_path`` and strips it from
+    ``path`` on the same dict the middleware holds. Reading the path after
+    ``call_next`` therefore sees `/api/tools/x/render` for a request that only
+    ever reached the static mount, and hands that response the branch that
+    omits `X-Frame-Options` and `Content-Security-Policy` entirely.
+    """
+    response = _get("/static/api/tools/x/render", mount_static=True)
+
+    # The file does not exist: this is the static mount's 404, not a route.
+    assert response.status_code == 404
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+def test_a_mounted_child_path_keeps_the_unconditional_headers():
+    response = _get("/static/api/document/d/render-pdf", mount_static=True)
+
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-frame-options"] == "DENY"
