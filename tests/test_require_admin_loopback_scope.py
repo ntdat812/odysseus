@@ -85,6 +85,17 @@ def test_remote_client_is_never_trusted_loopback():
         "cf-connecting-ip",
         "cf-ray",
         "cf-visitor",
+        # Review found this one missing: a proxy terminating on loopback that
+        # forwards only the scheme still read as a direct in-process call.
+        "x-forwarded-proto",
+        # The rest of the family, which an enumeration of spellings kept missing.
+        "x-forwarded-port",
+        "x-forwarded-prefix",
+        "x-forwarded-server",
+        "true-client-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "cdn-loop",
     ],
 )
 def test_forwarded_request_is_not_trusted_loopback(header):

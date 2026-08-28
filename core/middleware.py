@@ -49,10 +49,34 @@ def path_is_route_or_child(path: str, prefix: str) -> bool:
 # nginx, Caddy, Tailscale Funnel, …). cloudflared connects to the app FROM
 # 127.0.0.1, so without this check every tunneled request would look like
 # loopback and could bypass auth.
+# Any X-Forwarded-* header at all, matched by prefix rather than by name. The
+# original list named four of them and a proxy terminating on loopback that
+# forwards only X-Forwarded-Proto still read as a direct loopback request. An
+# enumeration of spellings is the wrong shape for this: the question is whether
+# something forwarded the request, and every member of that family answers it.
+PROXY_FORWARDING_HEADER_PREFIXES = ("x-forwarded-",)
+
+# Vendor headers that mean the same thing without the X-Forwarded- prefix.
 PROXY_FORWARDING_HEADERS = (
-    "cf-connecting-ip", "cf-ray", "cf-visitor",
-    "x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded",
+    "cdn-loop",
+    "cf-connecting-ip",
+    "cf-ray",
+    "cf-visitor",
+    "fastly-client-ip",
+    "forwarded",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-real-ip",
 )
+
+
+def is_proxy_forwarding_header(name: str) -> bool:
+    """True when ``name`` is evidence that a proxy or tunnel relayed a request."""
+    lowered = name.lower()
+    return lowered in PROXY_FORWARDING_HEADERS or lowered.startswith(
+        PROXY_FORWARDING_HEADER_PREFIXES
+    )
 
 
 def is_trusted_loopback(request: Request) -> bool:
@@ -75,8 +99,9 @@ def is_trusted_loopback(request: Request) -> bool:
     host = getattr(client, "host", None) if client is not None else None
     if host not in ("127.0.0.1", "::1"):
         return False
-    headers = request.headers
-    return not any(headers.get(name) for name in PROXY_FORWARDING_HEADERS)
+    return not any(
+        value for name, value in request.headers.items() if is_proxy_forwarding_header(name)
+    )
 
 
 def is_cors_preflight(method: str, headers) -> bool:
