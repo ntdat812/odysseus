@@ -127,3 +127,10 @@ where you run it matters:
 >
 > On native installs ChromaDB lives at `data/chroma/` and is included in the
 > snapshot normally.
+>
+> **Upgrading from a pre-#6166 install?** The old Compose files mounted
+> `chromadb-data` at the wrong path (`/chroma/chroma`), so the volume was
+> always empty while live data accumulated in the container's writable layer.
+> If you have a running pre-#6166 ChromaDB container, follow
+> [docs/chromadb-volume-migration.md](chromadb-volume-migration.md) to
+> rescue that data before recreating the container.
