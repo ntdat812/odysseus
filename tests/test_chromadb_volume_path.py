@@ -9,7 +9,7 @@ line — ``persist_path: "/data"``. The image declares no ``VOLUME``, so nothing
 outside a mount survives. ``/chroma/chroma`` is where pre-1.0 images kept the
 store.
 
-The documented backup procedure (docs/backup-restore.md) archives the
+The documented backup procedure (website/backup-restore.md) archives the
 ``chromadb-data`` volume, so a wrong mount point also makes that tarball empty.
 
 Pure YAML — no Docker required.
