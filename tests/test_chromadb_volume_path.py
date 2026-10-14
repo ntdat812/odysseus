@@ -151,3 +151,70 @@ def test_helper_legacy_check_catches_path_with_mount_option_suffix():
     assert mount.split(":")[1] == LEGACY_PERSIST_PATH, (
         "split(':')[1] must still identify the legacy target path with :z suffix"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for ChromaDB migration safety invariants (PR #6166 audit)
+# ---------------------------------------------------------------------------
+
+MIGRATION_DOC = ROOT / "docs" / "chromadb-volume-migration.md"
+
+
+def test_migration_guide_requires_quiescence_before_backup():
+    """Step 2 must stop ChromaDB before running docker cp to prevent torn SQLite pages."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "docker compose stop chromadb" in text, (
+        "Migration guide must require stopping ChromaDB before database backup"
+    )
+    # Confirm stopping step occurs prior to the cold backup step
+    stop_step = text.find("Step 2: Quiesce Writers and Gracefully Stop ChromaDB")
+    backup_step = text.find("Step 4: Take a Cold File Backup")
+    assert stop_step != -1 and backup_step != -1 and stop_step < backup_step, (
+        "Quiescence/stop step must precede cold backup step in migration sequence"
+    )
+
+
+def test_migration_guide_mandates_container_preservation_via_commit():
+    """Guide must preserve stopped container as an immutable image before any recreation."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "docker commit" in text, (
+        "Migration guide must instruct operators to commit the container to an immutable backup image"
+    )
+    assert "com.docker.compose.project" in text, (
+        "Guide must explain that Compose discovers containers by internal labels, not name alone"
+    )
+
+
+def test_migration_guide_requires_sqlite_and_hnsw_integrity_verification():
+    """Guide must mandate SQLite PRAGMA integrity_check and checking HNSW index files."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "PRAGMA integrity_check;" in text, (
+        "Migration guide must require SQLite PRAGMA integrity_check"
+    )
+    assert "data_level0.bin" in text or "*.bin" in text, (
+        "Migration guide must require verifying HNSW segment index binary files"
+    )
+
+
+def test_migration_guide_requires_empty_volume_precheck():
+    """Guide must verify destination volume is strictly empty prior to seeding."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "ls -A" in text or "empty and ready for seeding" in text, (
+        "Migration guide must check that the destination named volume is empty before seeding"
+    )
+
+
+def test_migration_guide_includes_staging_validation():
+    """Guide must validate the seeded volume with a staging container before Compose cutover."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "chromadb-staging" in text, (
+        "Migration guide must include staging container validation step"
+    )
+
+
+def test_migration_guide_warns_against_reverting_to_broken_mount():
+    """Rollback instructions must explicitly prohibit git checkout to pre-#6166 broken mount."""
+    text = MIGRATION_DOC.read_text(encoding="utf-8")
+    assert "Do not `git checkout` the pre-#6166 Compose file" in text or "broken" in text.lower(), (
+        "Rollback instructions must explain why checking out old Compose file breaks volume mount"
+    )
